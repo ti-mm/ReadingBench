@@ -111,7 +111,8 @@ def _build_intermediate_hops(ctx: TableContext, parsed_root: Path, vlm: VLMClien
     prompt = (
         "你是阅读科研论文表格的助手。请从表格中抽取不超过 {n} 个 key-value 对："
         "key 必须是表格中出现的“数据集名称”或“方法名称”；"
-        "value 用一句中文描述它和本文的关系（例如：本文方法、对比方法、最佳方法、使用的数据集、次优方法等）。"
+        "value 用一句中文描述它和本文的关系（如本文方法、对比方法、最佳方法、使用的数据集、次优方法等），"
+        "必要时指出相对排名/是否为本文提出。"
         "仅返回 JSON 对象 {{\"pairs\": [{{\"key\": \"...\", \"relation\": \"...\"}}, ...]}}，不要添加其它内容。"
     ).format(n=max_pairs)
     try:
@@ -131,8 +132,10 @@ def _build_intermediate_hops(ctx: TableContext, parsed_root: Path, vlm: VLMClien
 
 def _build_final_hops(ctx: TableContext, parsed_root: Path, vlm: VLMClient, max_qa: int) -> Dict[str, str]:
     prompt = (
-        "请基于表格内容生成不超过 {n} 个问答对。答案必须直接来自表格，可以是方法名称、数据集名称或具体指标值。"
-        "问题要明确指出指标/数据集/方法，使答案可核查。仅返回 JSON 对象 {{\"qa\": [{{\"question\": \"...\", \"answer\": \"...\"}}, ...]}}，不要添加其它内容。"
+        "请基于表格内容生成不超过 {n} 个问答对。"
+        "答案必须直接来自表格，可以是方法名称、数据集名称或具体指标值；"
+        "问题要明确指出指标/数据集/方法，使答案可核查。"
+        "仅返回 JSON 对象 {{\"qa\": [{{\"question\": \"...\", \"answer\": \"...\"}}, ...]}}，不要添加其它内容。"
     ).format(n=max_qa)
     try:
         data = vlm.ask_json(ctx.image_full_path(parsed_root), prompt, max_tokens=800)
@@ -152,6 +155,11 @@ def _build_final_hops(ctx: TableContext, parsed_root: Path, vlm: VLMClient, max_
 def build_paper_hops(
     paper_dir: Path,
     vlm_model: str = "gpt-4o-mini",
+    vlm_mode: str = "serve",  # serve 或 local
+    vlm_base_url: str | None = None,
+    vlm_api_key: str | None = None,
+    vlm_model_path: str | None = None,
+    vlm_gpus: str | None = None,  # 逗号分隔，如 "0,1,2,3"
     window: int = 10,
     max_intermediate: int = DEFAULT_INTERMEDIATE,
     max_final: int = DEFAULT_FINAL_QA,
@@ -176,7 +184,19 @@ def build_paper_hops(
     items = _load_content_list(vlm_dir, arxiv_id)
     contexts = _contexts_from_items(items, arxiv_id.name, vlm_dir, parsed_root, window=window)
 
-    vlm_client = VLMClient(config=VLMConfig(model=vlm_model))
+    gpu_ids = None
+    if vlm_gpus:
+        gpu_ids = [int(x) for x in vlm_gpus.split(",") if x.strip().isdigit()]
+    vlm_client = VLMClient(
+        config=VLMConfig(
+            model=vlm_model,
+            mode=vlm_mode,
+            base_url=vlm_base_url,
+            api_key=vlm_api_key,
+            model_path=vlm_model_path,
+            gpu_ids=gpu_ids or [0, 1, 2, 3],
+        )
+    )
 
     tables = []
     for ctx in contexts:
@@ -201,7 +221,12 @@ def build_paper_hops(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="为单篇论文构建基于表格的多跳 hop 结构（依赖 VLM）")
     parser.add_argument("--paper", type=Path, required=True, help="mineru 处理后的论文目录（arxiv_id 或其下的 vlm）")
-    parser.add_argument("--vlm-model", type=str, default="gpt-4o-mini", help="VLM 模型名（OpenAI 兼容）")
+    parser.add_argument("--vlm-model", type=str, default="gpt-4o-mini", help="VLM 模型名（serve 模式）")
+    parser.add_argument("--vlm-mode", type=str, default="serve", choices=["serve", "local"], help="VLM 调用模式")
+    parser.add_argument("--vlm-base-url", type=str, default=None, help="serve 模式 base_url（如 http://localhost:8000/v1）")
+    parser.add_argument("--vlm-api-key", type=str, default=None, help="serve 模式 api_key")
+    parser.add_argument("--vlm-model-path", type=str, default=None, help="local 模式模型路径（vLLM）")
+    parser.add_argument("--vlm-gpus", type=str, default=None, help="local 模式 GPU 列表，逗号分隔，默认 0,1,2,3")
     parser.add_argument("--window", type=int, default=10, help="表格前后收集的 text 数量")
     parser.add_argument("--max-intermediate", type=int, default=DEFAULT_INTERMEDIATE, help="每张表最多抽取的中间 hop 对数")
     parser.add_argument("--max-final", type=int, default=DEFAULT_FINAL_QA, help="每张表最多生成的最终问答对数")
@@ -220,6 +245,11 @@ def main() -> None:
     hops = build_paper_hops(
         paper_dir=args.paper,
         vlm_model=args.vlm_model,
+        vlm_mode=args.vlm_mode,
+        vlm_base_url=args.vlm_base_url,
+        vlm_api_key=args.vlm_api_key,
+        vlm_model_path=args.vlm_model_path,
+        vlm_gpus=args.vlm_gpus,
         window=args.window,
         max_intermediate=args.max_intermediate,
         max_final=args.max_final,

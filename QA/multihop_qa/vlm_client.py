@@ -10,17 +10,20 @@ from typing import Any, Dict, Optional
 
 @dataclass
 class VLMConfig:
-    model: str = "gpt-4o-mini"
+    model: str = "gpt-4o-mini"               # serve 模式的模型名称
     temperature: float = 0.2
-    base_url: Optional[str] = None  # 兼容 vLLM serve/openai proxy，例：http://localhost:8000/v1
-    api_key: Optional[str] = None   # 若未提供，默认取环境变量或用占位 "EMPTY"
+    base_url: Optional[str] = None           # serve 模式 base_url
+    api_key: Optional[str] = None            # serve 模式 api_key
+    mode: str = "serve"                      # "serve" (OpenAI 兼容) 或 "local" (本地 vLLM serve)
+    model_path: Optional[str] = None         # local 模式下 vLLM 模型路径（可选）
+    gpu_ids: Optional[list[int]] = None      # local 模式 GPU 列表，默认用前四张卡 [0,1,2,3]
 
 
 class VLMClient:
     """
-    可选的 VLM 调用封装。支持：
-    - 官方 OpenAI（默认读取 OPENAI_API_KEY）
-    - vLLM serve / 兼容 OpenAI 接口的服务（通过 base_url + api_key 或 VLM_BASE_URL 环境变量）
+    VLM 调用封装。参考 vLLM 多模态接口（https://docs.vllm.com.cn/en/latest/serving/multimodal_inputs.html）。
+    - serve: 直接调用 OpenAI 兼容接口（含 vLLM serve）
+    - local: 假定本地已启动 vLLM serve；默认 base_url=http://localhost:8000/v1，默认 GPU [0,1,2,3]
     """
 
     def __init__(self, config: Optional[VLMConfig] = None):
@@ -34,10 +37,19 @@ class VLMClient:
             from openai import OpenAI  # type: ignore
         except ImportError as exc:
             raise RuntimeError("需要安装 openai 包才能使用 VLM") from exc
-        base_url = self.config.base_url or os.environ.get("VLM_BASE_URL") or os.environ.get("OPENAI_BASE_URL")
-        api_key = self.config.api_key or os.environ.get("OPENAI_API_KEY") or os.environ.get("VLM_API_KEY") or "EMPTY"
-        if not base_url and api_key == "EMPTY":
-            raise RuntimeError("请设置 OPENAI_API_KEY，或提供 VLM_BASE_URL/VLM_API_KEY 以使用 vLLM serve")
+
+        if self.config.mode == "local":
+            # 本地 vLLM serve：默认走 localhost，允许通过 gpu_ids 限制可见卡（前四张卡）。
+            gpu_ids = self.config.gpu_ids or [0, 1, 2, 3]
+            os.environ.setdefault("CUDA_VISIBLE_DEVICES", ",".join(str(g) for g in gpu_ids))
+            base_url = self.config.base_url or "http://localhost:8000/v1"
+            api_key = self.config.api_key or "EMPTY"
+        else:
+            base_url = self.config.base_url or os.environ.get("VLM_BASE_URL") or os.environ.get("OPENAI_BASE_URL")
+            api_key = self.config.api_key or os.environ.get("OPENAI_API_KEY") or os.environ.get("VLM_API_KEY") or "EMPTY"
+            if not base_url and api_key == "EMPTY":
+                raise RuntimeError("请设置 OPENAI_API_KEY，或提供 VLM_BASE_URL/VLM_API_KEY 以使用 vLLM serve")
+
         self._client = OpenAI(api_key=api_key, base_url=base_url)
 
     def _encode_image(self, image_path: Path) -> str:
@@ -49,33 +61,12 @@ class VLMClient:
         { rows: [{dataset, method, metric_name, metric_value, rank?}], ranking_hint: ... }
         """
         self._ensure_client()
-        assert self._client is not None
-
         prompt = (
             "读取科学论文中的表格图片，返回 JSON，仅包含 rows 数组："
             "{dataset, method, metric_name, metric_value (字符串), rank(可选,1为最优)}。"
             "请保持纯 JSON 响应。"
         )
-        content = [
-            {"type": "text", "text": prompt},
-            {
-                "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{self._encode_image(image_path)}"},
-            },
-        ]
-        resp = self._client.chat.completions.create(
-            model=self.config.model,
-            temperature=self.config.temperature,
-            messages=[{"role": "user", "content": content}],
-            max_tokens=600,
-        )
-        message = resp.choices[0].message.content
-        if not message:
-            raise RuntimeError("VLM 返回为空")
-        try:
-            return json.loads(message)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(f"VLM JSON 解析失败: {message}") from exc
+        return self.ask_json(image_path, prompt, max_tokens=800)
 
     def ask_json(self, image_path: Path, prompt: str, max_tokens: int = 800) -> Dict[str, Any]:
         """
@@ -83,8 +74,7 @@ class VLMClient:
         """
         self._ensure_client()
         assert self._client is not None
-
-        content = [
+        content_payload = [
             {"type": "text", "text": prompt},
             {
                 "type": "image_url",
@@ -94,16 +84,17 @@ class VLMClient:
         resp = self._client.chat.completions.create(
             model=self.config.model,
             temperature=self.config.temperature,
-            messages=[{"role": "user", "content": content}],
+            messages=[{"role": "user", "content": content_payload}],
             max_tokens=max_tokens,
         )
-        message = resp.choices[0].message.content
-        if not message:
+        content = resp.choices[0].message.content if resp and resp.choices else ""
+
+        if not content:
             raise RuntimeError("VLM 返回为空")
         try:
-            return json.loads(message)
+            return json.loads(content)
         except json.JSONDecodeError as exc:
-            raise RuntimeError(f"VLM JSON 解析失败: {message}") from exc
+            raise RuntimeError(f"VLM JSON 解析失败: {content}") from exc
 
 
 class NullVLMClient(VLMClient):
