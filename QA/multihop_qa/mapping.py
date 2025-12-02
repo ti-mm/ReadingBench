@@ -155,11 +155,12 @@ def _build_final_hops(ctx: TableContext, parsed_root: Path, vlm: VLMClient, max_
 def build_paper_hops(
     paper_dir: Path,
     vlm_model: str = "gpt-4o-mini",
-    vlm_mode: str = "serve",  # serve 或 local
     vlm_base_url: str | None = None,
     vlm_api_key: str | None = None,
+    vlm_launch_server: bool = False,
     vlm_model_path: str | None = None,
     vlm_gpus: str | None = None,  # 逗号分隔，如 "0,1,2,3"
+    vlm_port: int = 8000,
     window: int = 10,
     max_intermediate: int = DEFAULT_INTERMEDIATE,
     max_final: int = DEFAULT_FINAL_QA,
@@ -190,11 +191,12 @@ def build_paper_hops(
     vlm_client = VLMClient(
         config=VLMConfig(
             model=vlm_model,
-            mode=vlm_mode,
             base_url=vlm_base_url,
             api_key=vlm_api_key,
+            launch_server=vlm_launch_server,
             model_path=vlm_model_path,
-            gpu_ids=gpu_ids or [0, 1, 2, 3],
+            gpus=gpu_ids or [0, 1, 2, 3],
+            port=vlm_port,
         )
     )
 
@@ -221,12 +223,13 @@ def build_paper_hops(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="为单篇论文构建基于表格的多跳 hop 结构（依赖 VLM）")
     parser.add_argument("--paper", type=Path, required=True, help="mineru 处理后的论文目录（arxiv_id 或其下的 vlm）")
-    parser.add_argument("--vlm-model", type=str, default="gpt-4o-mini", help="VLM 模型名（serve 模式）")
-    parser.add_argument("--vlm-mode", type=str, default="serve", choices=["serve", "local"], help="VLM 调用模式")
-    parser.add_argument("--vlm-base-url", type=str, default=None, help="serve 模式 base_url（如 http://localhost:8000/v1）")
-    parser.add_argument("--vlm-api-key", type=str, default=None, help="serve 模式 api_key")
-    parser.add_argument("--vlm-model-path", type=str, default=None, help="local 模式模型路径（vLLM）")
-    parser.add_argument("--vlm-gpus", type=str, default=None, help="local 模式 GPU 列表，逗号分隔，默认 0,1,2,3")
+    parser.add_argument("--vlm-model", type=str, default="gpt-4o-mini", help="VLM 模型名（serve 接口使用）")
+    parser.add_argument("--vlm-base-url", type=str, default=None, help="已有 vLLM serve 的 base_url（如 http://localhost:8000/v1）")
+    parser.add_argument("--vlm-api-key", type=str, default=None, help="serve 的 api_key")
+    parser.add_argument("--vlm-launch-server", action="store_true", help="是否在本进程内启动 vllm serve")
+    parser.add_argument("--vlm-model-path", type=str, default=None, help="启动 vllm serve 时的模型路径")
+    parser.add_argument("--vlm-gpus", type=str, default=None, help="启动 vllm serve 使用的 GPU，逗号分隔，默认前四张 0,1,2,3")
+    parser.add_argument("--vlm-port", type=int, default=8000, help="启动 vllm serve 的端口")
     parser.add_argument("--window", type=int, default=10, help="表格前后收集的 text 数量")
     parser.add_argument("--max-intermediate", type=int, default=DEFAULT_INTERMEDIATE, help="每张表最多抽取的中间 hop 对数")
     parser.add_argument("--max-final", type=int, default=DEFAULT_FINAL_QA, help="每张表最多生成的最终问答对数")
@@ -245,11 +248,12 @@ def main() -> None:
     hops = build_paper_hops(
         paper_dir=args.paper,
         vlm_model=args.vlm_model,
-        vlm_mode=args.vlm_mode,
         vlm_base_url=args.vlm_base_url,
         vlm_api_key=args.vlm_api_key,
+        vlm_launch_server=args.vlm_launch_server,
         vlm_model_path=args.vlm_model_path,
         vlm_gpus=args.vlm_gpus,
+        vlm_port=args.vlm_port,
         window=args.window,
         max_intermediate=args.max_intermediate,
         max_final=args.max_final,

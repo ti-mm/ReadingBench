@@ -15,9 +15,7 @@
      ...
    }
 
-注意：支持两种方式
-- 本地 Python: from vllm import LLM，指定 model_path 与 GPU 列表（默认用后 4 张卡）
-- OpenAI 兼容服务：vLLM serve 或其他，指定 base_url/api_key/model
+注意：仅支持 OpenAI 兼容服务（如 vLLM serve），通过 llm_client.ServeLLMClient 调用。
 """
 
 from __future__ import annotations
@@ -26,7 +24,7 @@ import json
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence
 
-from multihop_qa.llm_client import BaseLLMClient, LocalLLMClient, LocalLLMConfig, ServeLLMClient, ServeLLMConfig
+from multihop_qa.llm_client import BaseLLMClient, ServeLLMClient, ServeLLMConfig
 
 
 def extract_ref_texts(arxiv_id: str, base_dir: Path) -> List[str]:
