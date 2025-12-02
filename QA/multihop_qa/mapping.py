@@ -111,8 +111,9 @@ def _build_intermediate_hops(ctx: TableContext, parsed_root: Path, vlm: VLMClien
     prompt = (
         "你是阅读科研论文表格的助手。请从表格中抽取不超过 {n} 个 key-value 对："
         "key 必须是表格中出现的“数据集名称”或“方法名称”；"
-        "value 用一句中文描述它和本文的关系（如本文方法、对比方法、最佳方法、使用的数据集、次优方法等），"
-        "必要时指出相对排名/是否为本文提出。"
+        "value 用一句中文描述它和本文的关系（如本文方法/对比方法/最佳方法/使用的数据集等），"
+        "同时加入能唯一指向该方法或引用的线索，优先使用表格内容本身：例如“在XX数据集上排名第Y”“主实验”“消融”“Level-3”"
+        "或表内出现的年份/编号/标题片段等，避免仅给模糊描述。"
         "仅返回 JSON 对象 {{\"pairs\": [{{\"key\": \"...\", \"relation\": \"...\"}}, ...]}}，不要添加其它内容。"
     ).format(n=max_pairs)
     try:
@@ -128,6 +129,20 @@ def _build_intermediate_hops(ctx: TableContext, parsed_root: Path, vlm: VLMClien
         if key and rel and key not in result:
             result[key] = rel
     return result
+
+
+def _classify_table_role(ctx: TableContext, parsed_root: Path, vlm: VLMClient) -> Dict[str, str]:
+    prompt = (
+        "判断表格的用途，返回 JSON：{\"role\": \"主实验/消融/数据集描述/超参/其他\", \"reason\": \"简要理由\"}。"
+        "仅返回 JSON。"
+    )
+    try:
+        data = vlm.ask_json(ctx.image_full_path(parsed_root), prompt, max_tokens=200)
+        role = str(data.get("role", "")).strip()
+        reason = str(data.get("reason", "")).strip()
+    except Exception as exc:  # noqa: BLE001
+        role, reason = "", f"failed: {exc}"
+    return {"table_role": role or "未知", "table_role_reason": reason}
 
 
 def _build_final_hops(ctx: TableContext, parsed_root: Path, vlm: VLMClient, max_qa: int) -> Dict[str, str]:
@@ -208,6 +223,7 @@ def build_paper_hops(
             intermediate = _build_intermediate_hops(ctx, parsed_root, vlm_client, max_intermediate)
         elif mode == "final":
             final_hops = _build_final_hops(ctx, parsed_root, vlm_client, max_final)
+        role_info = _classify_table_role(ctx, parsed_root, vlm_client)
         tables.append(
             {
                 "page_idx": ctx.page_idx,
@@ -215,6 +231,7 @@ def build_paper_hops(
                 "image_path": str(ctx.image_full_path(parsed_root)),
                 "intermediate_hops": intermediate,
                 "final_hops": final_hops,
+                **role_info,
             }
         )
     return {"paper_id": arxiv_id.name, "tables": tables}
