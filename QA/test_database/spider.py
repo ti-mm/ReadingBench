@@ -123,25 +123,33 @@ def _download_and_extract_latex(arxiv_id: str, latex_dir: Path) -> Optional[Path
     """
     url = f"https://arxiv.org/src/{arxiv_id}"
     target_dir = latex_dir / arxiv_id
+    tmp_dir = latex_dir / f"{arxiv_id}__tmp"
     if target_dir.exists():
         shutil.rmtree(target_dir)
-    target_dir.mkdir(parents=True, exist_ok=True)
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    tar_path = target_dir / f"{arxiv_id}.tar.gz"
+    tar_path = tmp_dir / f"{arxiv_id}.tar.gz"
     try:
         resp = _polite_get(url, timeout=30.0)
         tar_path.write_bytes(resp.content)
     except Exception as exc:
         logger.warning(f"Failed to download latex src for {arxiv_id}: {exc}")
+        shutil.rmtree(tmp_dir, ignore_errors=True)
         return None
 
     try:
         with tarfile.open(tar_path, "r:gz") as tar:
-            tar.extractall(path=target_dir)
+            tar.extractall(path=tmp_dir)
         tar_path.unlink(missing_ok=True)
     except Exception as exc:
         logger.warning(f"Failed to extract latex src for {arxiv_id}: {exc}")
+        shutil.rmtree(tmp_dir, ignore_errors=True)
         return None
+
+    # 将 tmp_dir 提升为正式目录，确保失败时不会留下空目录
+    tmp_dir.rename(target_dir)
 
     # 只保留子文件夹，若存在直接子文件则保留在 target_dir。
     # 返回顶级子目录路径（若存在唯一子目录），否则返回 target_dir。
@@ -201,12 +209,19 @@ def main():
 
             # 3. download and extract LaTeX source（若不存在再下载）
             latex_candidate = latex_dir / arxiv_id
-            if not latex_candidate.exists():
+            if latex_candidate.exists() and not any(latex_candidate.iterdir()):
+                # 清理掉空目录，防止误判为已下载
+                shutil.rmtree(latex_candidate, ignore_errors=True)
+
+            latex_path: Optional[Path] = latex_candidate if latex_candidate.exists() else None
+            if latex_path is None:
                 try:
-                    _download_and_extract_latex(arxiv_id, latex_dir)
+                    latex_path = _download_and_extract_latex(arxiv_id, latex_dir)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(f"LaTeX src failed for {arxiv_id}: {exc}")
-            meta["latex_path"] = str(latex_candidate) if latex_candidate.exists() else None
+                    latex_path = None
+
+            meta["latex_path"] = str(latex_path) if latex_path and Path(latex_path).exists() else None
 
             # add pdf/parsed paths
             meta["pdf_path"] = str(pdf_path) if pdf_path.exists() else None
