@@ -4,6 +4,8 @@ import time
 import random
 import html
 import re
+import tarfile
+import shutil
 import requests
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -11,6 +13,7 @@ from bs4 import BeautifulSoup
 from loguru import logger
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import argparse
 
 # ---------------------------
 # Your helper functions
@@ -114,17 +117,58 @@ def _scrape_abs_page(arxiv_id: str, timeout: float = 15.0) -> Optional[Dict[str,
     }
 
 
+def _download_and_extract_latex(arxiv_id: str, latex_dir: Path) -> Optional[Path]:
+    """
+    下载 arxiv 源码 tar.gz 并解压，返回解压后的子目录路径；若失败返回 None。
+    """
+    url = f"https://arxiv.org/src/{arxiv_id}"
+    target_dir = latex_dir / arxiv_id
+    if target_dir.exists():
+        shutil.rmtree(target_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    tar_path = target_dir / f"{arxiv_id}.tar.gz"
+    try:
+        resp = _polite_get(url, timeout=30.0)
+        tar_path.write_bytes(resp.content)
+    except Exception as exc:
+        logger.warning(f"Failed to download latex src for {arxiv_id}: {exc}")
+        return None
+
+    try:
+        with tarfile.open(tar_path, "r:gz") as tar:
+            tar.extractall(path=target_dir)
+        tar_path.unlink(missing_ok=True)
+    except Exception as exc:
+        logger.warning(f"Failed to extract latex src for {arxiv_id}: {exc}")
+        return None
+
+    # 只保留子文件夹，若存在直接子文件则保留在 target_dir。
+    # 返回顶级子目录路径（若存在唯一子目录），否则返回 target_dir。
+    subdirs = [p for p in target_dir.iterdir() if p.is_dir()]
+    if len(subdirs) == 1:
+        return subdirs[0]
+    return target_dir
+
+
 # -----------------------------------
 # Main pipeline
 # -----------------------------------
 
 def main():
-    base_dir = "/Users/tim/Desktop/arxiv_spider/QA/test_database"
-    ids_file = f"{base_dir}/candidate_arxiv_ids.json"
-    metadata_out = f"{base_dir}.metadata.jsonl"
-    pdf_dir = f"{base_dir}/pdfs"
+    parser = argparse.ArgumentParser(description="Fetch arXiv metadata, PDFs, and LaTeX sources.")
+    parser.add_argument("--base-dir", type=Path, default=Path("/Users/tim/Downloads/ReadingBench/QA/test_database"))
+    parser.add_argument("--ids-file", type=Path, default=Path("/Users/tim/Downloads/ReadingBench/QA/test_database/candidate_arxiv_ids.json"), help="Path to candidate_arxiv_ids.json")
+    args = parser.parse_args()
 
-    os.makedirs(pdf_dir, exist_ok=True)
+    base_dir = args.base_dir
+    ids_file = args.ids_file or (base_dir / "candidate_arxiv_ids.json")
+    metadata_out = base_dir / "metadata.jsonl"
+    pdf_dir = base_dir / "pdfs"
+    latex_dir = base_dir / "latex_src"
+
+    pdf_dir.mkdir(parents=True, exist_ok=True)
+    latex_dir.mkdir(parents=True, exist_ok=True)
 
     # load arxiv id list
     with open(ids_file, "r") as f:
@@ -143,21 +187,34 @@ def main():
                 logger.error(f"Metadata failed for {arxiv_id}")
                 continue
 
-            # write metadata jsonl
-            fout.write(json.dumps(meta, ensure_ascii=False) + "\n")
-
             # 2. download pdf
             pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
-            pdf_path = f"{pdf_dir}/{arxiv_id}.pdf"
+            pdf_path = pdf_dir / f"{arxiv_id}.pdf"
 
-            if not os.path.exists(pdf_path):
+            if not pdf_path.exists():
                 try:
                     pdf_resp = _polite_get(pdf_url)
-                    with open(pdf_path, "wb") as pdf_f:
-                        pdf_f.write(pdf_resp.content)
+                    pdf_path.write_bytes(pdf_resp.content)
                     logger.info(f"PDF saved: {pdf_path}")
                 except Exception as exc:
                     logger.error(f"Failed to download pdf for {arxiv_id}: {exc}")
+
+            # 3. download and extract LaTeX source（若不存在再下载）
+            latex_candidate = latex_dir / arxiv_id
+            if not latex_candidate.exists():
+                try:
+                    _download_and_extract_latex(arxiv_id, latex_dir)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"LaTeX src failed for {arxiv_id}: {exc}")
+            meta["latex_path"] = str(latex_candidate) if latex_candidate.exists() else None
+
+            # add pdf/parsed paths
+            meta["pdf_path"] = str(pdf_path) if pdf_path.exists() else None
+            parsed_dir = base_dir / "parsed_pdfs" / arxiv_id
+            meta["parsed_path"] = str(parsed_dir) if parsed_dir.exists() else None
+
+            # write metadata jsonl
+            fout.write(json.dumps(meta, ensure_ascii=False) + "\n")
 
             time.sleep(random.uniform(0.3, 0.8))
 

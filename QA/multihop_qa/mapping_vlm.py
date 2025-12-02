@@ -149,6 +149,7 @@ def _build_final_hops(ctx: TableContext, parsed_root: Path, vlm: VLMClient, max_
     prompt = (
         "请基于表格内容生成不超过 {n} 个问答对。"
         "答案必须直接来自表格，可以是方法名称、数据集名称或具体指标值；"
+        "若答案是指标值，请在答案中包含该方法在相应数据集上的排名（如：'Top-2: 45.6'），排名依据表格排序。"
         "问题要明确指出指标/数据集/方法，使答案可核查。"
         "仅返回 JSON 对象 {{\"qa\": [{{\"question\": \"...\", \"answer\": \"...\"}}, ...]}}，不要添加其它内容。"
     ).format(n=max_qa)
@@ -241,7 +242,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="为单篇论文构建基于表格的多跳 hop 结构（依赖 VLM）")
     parser.add_argument("--paper", type=Path, required=True, help="mineru 处理后的论文目录（arxiv_id 或其下的 vlm）")
     parser.add_argument("--vlm-model", type=str, default="gpt-4o-mini", help="VLM 模型名（serve 接口使用）")
-    parser.add_argument("--vlm-base-url", type=str, default=None, help="已有 vLLM serve 的 base_url（如 http://localhost:8000/v1）")
+    parser.add_argument("--vlm-base-url", type=str, default="http://localhost:8000/v1", help="已有 vLLM serve 的 base_url（如 http://localhost:8000/v1）")
     parser.add_argument("--vlm-api-key", type=str, default=None, help="serve 的 api_key")
     parser.add_argument("--vlm-launch-server", action="store_true", help="是否在本进程内启动 vllm serve")
     parser.add_argument("--vlm-model-path", type=str, default=None, help="启动 vllm serve 时的模型路径")
