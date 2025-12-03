@@ -362,14 +362,12 @@ def build_paper_hops(
         port=extract_vlm_port,
     )
 
-<<<<<<< HEAD
     # --- 自定义保存目录设置 ---
     BASE_SAVE_DIR = Path("/inspire/hdd/project/embodied-multimodality/lujiahao-253108120106/workspace/ReadingBench/QA/multihop_qa/Table_Json")
     # 为当前论文创建一个专属子文件夹: Table_Json/{arxiv_id}/
     PAPER_SAVE_DIR = BASE_SAVE_DIR / arxiv_id.name
     PAPER_SAVE_DIR.mkdir(parents=True, exist_ok=True)
     # -----------------------
-=======
     verify_gpu_ids = extract_gpu_ids
     if verify_vlm_gpus:
         verify_gpu_ids = [int(x) for x in verify_vlm_gpus.split(",") if x.strip().isdigit()]
@@ -384,7 +382,6 @@ def build_paper_hops(
             gpus=verify_gpu_ids,
             port=verify_vlm_port if verify_vlm_port is not None else extract_vlm_port,
         )
->>>>>>> 10aea7b409fe5fe050c42c32910a0e168ed65145
 
     tables = []
     for t_idx, ctx in enumerate(contexts):
