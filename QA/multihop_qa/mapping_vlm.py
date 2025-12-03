@@ -219,7 +219,10 @@ def _structured_table_prompt(caption: List[str]) -> str:
         '  \"groups\": { ... }\n'
         "}\n\n"
         f"{cap_line}\n"
-        "只返回 JSON。"
+        "重要格式要求：\n"
+        "1. 请直接返回纯 JSON 字符串。\n"
+        "2. 严禁使用 Markdown 代码块格式（即不要用 ```json 包裹）。\n"
+        "3. 不要输出任何解释性文字，只返回 JSON 数据。"
     )
 
 
@@ -243,8 +246,12 @@ def _verify_prompt(structured_json: Dict, latex_table: Dict) -> str:
         "任务：\n"
         "1) 判断 JSON 是否对应这段 LaTeX 的同一张表（same_table）。\n"
         "2) 若对应，检查列/分组/数据是否一致，指出缺失或错误。\n"
-        '仅返回 JSON：{"same_table": true/false, "content_match": true/false, "problems": ["..."], "summary": "..."}。'
-        "如果不是同一张表，content_match 必须为 false，并在 problems 写原因。"
+        "请严格遵守以下 JSON 格式返回：\n"
+        '{"same_table": true/false, "content_match": true/false, "problems": ["..."], "summary": "..."}\n\n'
+        "重要格式警告：\n"
+        "- 必须直接返回纯 JSON 字符串。\n"
+        "- 绝对不要使用 Markdown 代码块（不要用 ```json ... ```）。\n"
+        "- 不要包含任何其他前缀或后缀文字。\n"
         f"\n\nLaTeX 表格片段：\n{latex_text}\n\n图片抽取 JSON：\n{structured_text}"
     )
 
@@ -263,12 +270,16 @@ def _load_latex_tables(arxiv_id: Path, base_dir: Path) -> List[Dict]:
     ]
     latex_dir = next((p for p in candidates if p.exists()), None)
     if not latex_dir:
+        print(f"[Warning] Latex directory not found in candidates: {candidates}")
         return []
     try:
-        return extract_tables_from_package(
+        tables = extract_tables_from_package(
             latex_dir, context_chars=400, limit_by_content_list=True, base_dir=base_dir
         )
-    except Exception:
+        print(f"[Info] Found {len(tables)} tables in Latex source.")
+        return tables
+    except Exception as e:
+        print(f"[Error] Failed to extract latex tables: {e}")
         return []
 
 
@@ -326,6 +337,13 @@ def build_paper_hops(
         )
     )
 
+    # --- 自定义保存目录设置 ---
+    BASE_SAVE_DIR = Path("/inspire/hdd/project/embodied-multimodality/lujiahao-253108120106/workspace/ReadingBench/QA/multihop_qa/Table_Json")
+    # 为当前论文创建一个专属子文件夹: Table_Json/{arxiv_id}/
+    PAPER_SAVE_DIR = BASE_SAVE_DIR / arxiv_id.name
+    PAPER_SAVE_DIR.mkdir(parents=True, exist_ok=True)
+    # -----------------------
+
     tables = []
     for t_idx, ctx in enumerate(contexts):
         record: Dict[str, object] = {
@@ -334,11 +352,14 @@ def build_paper_hops(
             "table_order_index": t_idx,
             "image_path": str(ctx.image_full_path(parsed_root)),
         }
+        
+        # 1. 提取结构化数据
         try:
             record["structured"] = _structured_table_from_image(ctx, parsed_root, vlm_client)
         except Exception as exc:  # noqa: BLE001
             record["structured_error"] = str(exc)
 
+        # 2. 验证 (如果有 Latex)
         if verify_with_latex:
             if not latex_tables:
                 record["latex_verification"] = {"error": "latex_tables_not_found"}
@@ -358,6 +379,18 @@ def build_paper_hops(
                     )
                 except Exception as exc:  # noqa: BLE001
                     record["latex_verification"] = {"error": str(exc)}
+
+        # 3. 将包含验证信息的完整 record 写入文件
+        try:
+            # 命名格式: {pdf名字}_table_{第几个table}.json
+            file_name = f"{arxiv_id.name}_table_{t_idx}.json"
+            save_path = PAPER_SAVE_DIR / file_name
+            with open(save_path, "w", encoding="utf-8") as f:
+                json.dump(record, f, ensure_ascii=False, indent=2)
+            print(f"[Saved] {save_path} (Included Latex Verification: {'latex_verification' in record})")
+        except Exception as e:
+            print(f"[Error] Failed to save file: {e}")
+
         tables.append(record)
     return {"paper_id": arxiv_id.name, "tables": tables}
 
