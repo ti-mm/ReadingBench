@@ -1,36 +1,34 @@
 #!/usr/bin/env python3
 """
-构建基于单篇论文的多跳问答节点。
-
-Hop 划分：
-- 中间 hop：从每个表格抽取若干 key/value，对应“数据集/方法”->“与论文的关系”，依赖 VLM。
-- 最后一跳：从表格构造问答，答案是方法名/数据集/指标值，依赖 VLM。
-
-输出：列表，每个元素对应一张表格，包含中间 hop dict 和最后一跳的 QA dict。
+从 MinerU 解析结果中取正文表格，调用 VLM 将表格图片转为结构化 JSON，可选再对照 LaTeX 表格做一致性判定。
 
 示例：
-    python QA/multihop_qa/mapping.py --paper QA/test_database/parsed_pdfs/1610.02136 --use-vlm
+    python QA/multihop_qa/mapping_vlm.py --paper QA/test_database/parsed_pdfs/1610.02136 --verify-with-latex
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
 from multihop_qa.models import TableContext
+from multihop_qa.mapping_llm import extract_tables_from_package
 from multihop_qa.vlm_client import VLMClient, VLMConfig
 
-# 默认提取数量
-DEFAULT_INTERMEDIATE = 5
-DEFAULT_FINAL_QA = 3
-MODE_CHOICES = ("intermediate", "final")
+STRUCTURED_TABLE_MAX_TOKENS = 1600
+VERIFY_MAX_TOKENS = 600
+
+
+def _trim_text(text: str, limit: int = 3200) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n...[truncated]..."
 
 
 def _locate_vlm_dir(paper_dir: Path) -> Tuple[Path, Path, Path]:
@@ -67,7 +65,30 @@ def _load_content_list(vlm_dir: Path, arxiv_id: Path) -> List[Dict]:
     return json.loads(candidates[0].read_text(encoding="utf-8"))
 
 
-def _contexts_from_items(items: List[Dict], arxiv_id: str, vlm_dir: Path, parsed_root: Path, window: int = 10) -> List[TableContext]:
+def _body_only_items(items: List[Dict]) -> List[Dict]:
+    """
+    截断 content_list：遇到 ref_text 或正文中的 references/appendix 标记即停止。
+    """
+    cutoff_idx: Optional[int] = None
+    for idx, item in enumerate(items):
+        if item.get("type") == "ref_text":
+            cutoff_idx = idx
+            break
+        if item.get("type") == "text":
+            text_norm = str(item.get("text", "")).strip().lower()
+            if text_norm in {"references", "appendix"}:
+                cutoff_idx = idx
+                break
+    return items if cutoff_idx is None else items[:cutoff_idx]
+
+
+def _contexts_from_items(
+    items: List[Dict],
+    arxiv_id: str,
+    vlm_dir: Path,
+    parsed_root: Path,
+    window: int = 10,
+) -> List[TableContext]:
     text_positions: List[int] = []
     text_values: List[str] = []
     for idx, item in enumerate(items):
@@ -107,65 +128,140 @@ def _contexts_from_items(items: List[Dict], arxiv_id: str, vlm_dir: Path, parsed
     return contexts
 
 
-def _build_intermediate_hops(ctx: TableContext, parsed_root: Path, vlm: VLMClient, max_pairs: int) -> Dict[str, str]:
-    prompt = (
-        "你是阅读科研论文表格的助手。请从表格中抽取不超过 {n} 个 key-value 对："
-        "key 必须是表格中出现的“数据集名称”或“方法名称”；"
-        "value 用一句中文描述它和本文的关系（如本文方法/对比方法/最佳方法/使用的数据集等），"
-        "同时加入能唯一指向该方法或引用的线索，优先使用表格内容本身：例如“在XX数据集上排名第Y”“主实验”“消融”“Level-3”"
-        "或表内出现的年份/编号/标题片段等，避免仅给模糊描述。"
-        "仅返回 JSON 对象 {{\"pairs\": [{{\"key\": \"...\", \"relation\": \"...\"}}, ...]}}，不要添加其它内容。"
-    ).format(n=max_pairs)
-    try:
-        data = vlm.ask_json(ctx.image_full_path(parsed_root), prompt, max_tokens=800)
-        pairs = data.get("pairs", [])
-    except Exception as exc:  # noqa: BLE001
-        print(f"[warn] 中间 hop VLM 失败: {exc}", file=sys.stderr)
-        pairs = []
-    result: Dict[str, str] = {}
-    for p in pairs:
-        key = str(p.get("key", "")).strip()
-        rel = str(p.get("relation", "")).strip()
-        if key and rel and key not in result:
-            result[key] = rel
-    return result
-
-
-def _classify_table_role(ctx: TableContext, parsed_root: Path, vlm: VLMClient) -> Dict[str, str]:
-    prompt = (
-        "判断表格的用途，返回 JSON：{\"role\": \"主实验/消融/数据集描述/超参/其他\", \"reason\": \"简要理由\"}。"
-        "仅返回 JSON。"
+def _structured_table_prompt(caption: List[str]) -> str:
+    cap = " ".join(caption).strip()
+    cap_line = f"表格 caption: {cap}" if cap else "表格 caption: （未提供）"
+    return (
+        "你将收到一张表格图片，请将其转换为结构化 JSON。表格可能包含以下结构：\n\n"
+        "- 可能有 group（大分组）\n"
+        "- 可能有 subgroup（小分组）\n"
+        "- 可能没有分组\n\n"
+        "- 列头可能有多级结构：column → subcolumn → subsubcolumn，最多不超过三级。\n"
+        "- 行数据与列结构对应。\n\n"
+        "请按以下规则输出 JSON：\n"
+        "===============\n【1. 分组结构】\n===============\n\n"
+        "若表格包含分组：\n\n"
+        "{\n"
+        '  "caption": "...",\n'
+        '  "groups": {\n'
+        '    "GroupName": {\n'
+        '      "subgroups": {\n'
+        '        "SubGroupName": {\n'
+        '          "columns": [...],\n'
+        '          "rows": [...]\n'
+        "        }\n"
+        "      },\n"
+        '      "columns": [...],\n'
+        '      "rows": [...]\n'
+        "    }\n"
+        "  }\n"
+        "}\n\n"
+        "说明：group 是第一层，subgroup 是第二层；无分组时不要输出 groups 字段，直接给 columns/rows。\n\n"
+        "===============\n【2. 列结构最多三层】\n===============\n\n"
+        "列结构规则：\n"
+        "(1) 只有一层列头：\n"
+        '\"columns\": [\"Lv.1\", \"Lv.2\", \"Avg.\"]\n\n'
+        "(2) 两层列头：\n"
+        '\"columns\": [\n'
+        '  {\n'
+        '    \"column\": \"General AI Assistant\",\n'
+        '    \"subcolumns\": [\"Lv.1\", \"Lv.2\", \"Lv.3\", \"Avg.\"]\n'
+        "  }\n"
+        "]\n\n"
+        "(3) 三层列头：\n"
+        '\"columns\": [\n'
+        '  {\n'
+        '    \"column\": \"Humanity’s Last Exam\",\n'
+        '    \"subcolumns\": [\n'
+        '      {\n'
+        '        \"subcolumn\": \"Knowledge\",\n'
+        '        \"subsubcolumns\": [\"NS\", \"CE\", \"SF\"]\n'
+        "      },\n"
+        '      \"Avg.\"\n'
+        "    ]\n"
+        "  }\n"
+        "]\n\n"
+        "超过三层时，将多余层级平铺到 subsubcolumns。\n\n"
+        "===============\n【3. 行结构对齐列结构】\n===============\n"
+        "行数据必须与列结构对应，例如：\n"
+        "{\n"
+        '  \"Method\": \"...\",\n'
+        '  \"General AI Assistant\": {\n'
+        '    \"Lv.1\": \"...\",\n'
+        '    \"Lv.2\": \"...\",\n'
+        '    \"Lv.3\": \"...\",\n'
+        '    \"Avg.\": \"...\"\n'
+        "  },\n"
+        '  \"Humanity’s Last Exam\": {\n'
+        '    \"Knowledge\": {\n'
+        '      \"NS\": \"...\",\n'
+        '      \"CE\": \"...\",\n'
+        '      \"SF\": \"...\"\n'
+        "    },\n"
+        '    \"Avg.\": \"...\"\n'
+        "  }\n"
+        "}\n\n"
+        "===============\n【4. 数据格式要求】\n===============\n"
+        "- 所有数值都输出字符串；\n"
+        "- 空白/破折号用 null；\n"
+        "- 列名中的脚注符号（如 †、*）必须保留；\n"
+        "- 不输出 Markdown、解释或代码块，只能返回 JSON。\n\n"
+        "===============\n【5. 顶层结构】\n===============\n"
+        "无分组：{\n"
+        '  \"caption\": \"...\",\n'
+        '  \"columns\": [...],\n'
+        '  \"rows\": [...]\n'
+        "}\n\n"
+        "有分组：{\n"
+        '  \"caption\": \"...\",\n'
+        '  \"groups\": { ... }\n'
+        "}\n\n"
+        f"{cap_line}\n"
+        "只返回 JSON。"
     )
-    try:
-        data = vlm.ask_json(ctx.image_full_path(parsed_root), prompt, max_tokens=200)
-        role = str(data.get("role", "")).strip()
-        reason = str(data.get("reason", "")).strip()
-    except Exception as exc:  # noqa: BLE001
-        role, reason = "", f"failed: {exc}"
-    return {"table_role": role or "未知", "table_role_reason": reason}
 
 
-def _build_final_hops(ctx: TableContext, parsed_root: Path, vlm: VLMClient, max_qa: int) -> Dict[str, str]:
-    prompt = (
-        "请基于表格内容生成不超过 {n} 个问答对。"
-        "答案必须直接来自表格，可以是方法名称、数据集名称或具体指标值；"
-        "若答案是指标值，请在答案中包含该方法在相应数据集上的排名（如：'Top-2: 45.6'），排名依据表格排序。"
-        "问题要明确指出指标/数据集/方法，使答案可核查。"
-        "仅返回 JSON 对象 {{\"qa\": [{{\"question\": \"...\", \"answer\": \"...\"}}, ...]}}，不要添加其它内容。"
-    ).format(n=max_qa)
+def _structured_table_from_image(ctx: TableContext, parsed_root: Path, vlm: VLMClient) -> Dict:
+    prompt = _structured_table_prompt(ctx.table_caption)
+    return vlm.ask_json(ctx.image_full_path(parsed_root), prompt, max_tokens=STRUCTURED_TABLE_MAX_TOKENS)
+
+
+def _verify_prompt(structured_json: Dict, latex_table: Dict) -> str:
+    latex_body = latex_table.get("content") or ""
+    latex_text = _trim_text(latex_body, limit=3000)
+    structured_text = json.dumps(structured_json, ensure_ascii=False)
+    return (
+        "你会看到表格图片（已附在消息中）、该表格的 LaTeX 片段，以及从图片抽取的 JSON。"
+        "任务：\n"
+        "1) 判断 JSON 是否对应这段 LaTeX 的同一张表（same_table）。\n"
+        "2) 若对应，检查列/分组/数据是否一致，指出缺失或错误。\n"
+        '仅返回 JSON：{"same_table": true/false, "content_match": true/false, "problems": ["..."], "summary": "..."}。'
+        "如果不是同一张表，content_match 必须为 false，并在 problems 写原因。"
+        f"\n\nLaTeX 表格片段：\n{latex_text}\n\n图片抽取 JSON：\n{structured_text}"
+    )
+
+
+def _verify_structured_with_latex(
+    ctx: TableContext, parsed_root: Path, vlm: VLMClient, structured_json: Dict, latex_table: Dict
+) -> Dict:
+    prompt = _verify_prompt(structured_json, latex_table)
+    return vlm.ask_json(ctx.image_full_path(parsed_root), prompt, max_tokens=VERIFY_MAX_TOKENS)
+
+
+def _load_latex_tables(arxiv_id: Path, base_dir: Path) -> List[Dict]:
+    candidates = [
+        base_dir / "test_database" / "latex_src" / arxiv_id.name,
+        base_dir / "latex_src" / arxiv_id.name,
+    ]
+    latex_dir = next((p for p in candidates if p.exists()), None)
+    if not latex_dir:
+        return []
     try:
-        data = vlm.ask_json(ctx.image_full_path(parsed_root), prompt, max_tokens=800)
-        qa_list = data.get("qa", [])
-    except Exception as exc:  # noqa: BLE001
-        print(f"[warn] 最后一跳 VLM 失败: {exc}", file=sys.stderr)
-        qa_list = []
-    result: Dict[str, str] = {}
-    for qa in qa_list:
-        ans = str(qa.get("answer", "")).strip()
-        q = str(qa.get("question", "")).strip()
-        if ans and q and ans not in result:
-            result[ans] = q
-    return result
+        return extract_tables_from_package(
+            latex_dir, context_chars=400, limit_by_content_list=True, base_dir=base_dir
+        )
+    except Exception:
+        return []
 
 
 def build_paper_hops(
@@ -178,9 +274,9 @@ def build_paper_hops(
     vlm_gpus: str | None = None,  # 逗号分隔，如 "0,1,2,3"
     vlm_port: int = 8000,
     window: int = 10,
-    max_intermediate: int = DEFAULT_INTERMEDIATE,
-    max_final: int = DEFAULT_FINAL_QA,
-    mode: str = "intermediate",
+    body_only: bool = True,
+    verify_with_latex: bool = False,
+    latex_base: Path | None = None,
 ) -> Dict:
     """
     返回结构:
@@ -191,15 +287,21 @@ def build_paper_hops(
            "page_idx": ...,
            "table_entry_index": ...,
            "image_path": "...",
-           "intermediate_hops": {key: relation},
-           "final_hops": {answer: question}
+           "structured": {...},
+           "latex_verification": {...}  # 可选
          }, ...
       ]
     }
     """
     vlm_dir, parsed_root, arxiv_id = _locate_vlm_dir(paper_dir)
     items = _load_content_list(vlm_dir, arxiv_id)
+    if body_only:
+        items = _body_only_items(items)
     contexts = _contexts_from_items(items, arxiv_id.name, vlm_dir, parsed_root, window=window)
+
+    latex_tables: List[Dict] = []
+    if verify_with_latex:
+        latex_tables = _load_latex_tables(arxiv_id, latex_base or PACKAGE_ROOT)
 
     gpu_ids = None
     if vlm_gpus:
@@ -217,24 +319,38 @@ def build_paper_hops(
     )
 
     tables = []
-    for ctx in contexts:
-        intermediate = {}
-        final_hops = {}
-        if mode == "intermediate":
-            intermediate = _build_intermediate_hops(ctx, parsed_root, vlm_client, max_intermediate)
-        elif mode == "final":
-            final_hops = _build_final_hops(ctx, parsed_root, vlm_client, max_final)
-        role_info = _classify_table_role(ctx, parsed_root, vlm_client)
-        tables.append(
-            {
-                "page_idx": ctx.page_idx,
-                "table_entry_index": ctx.table_entry_index,
-                "image_path": str(ctx.image_full_path(parsed_root)),
-                "intermediate_hops": intermediate,
-                "final_hops": final_hops,
-                **role_info,
-            }
-        )
+    for t_idx, ctx in enumerate(contexts):
+        record: Dict[str, object] = {
+            "page_idx": ctx.page_idx,
+            "table_entry_index": ctx.table_entry_index,
+            "table_order_index": t_idx,
+            "image_path": str(ctx.image_full_path(parsed_root)),
+        }
+        try:
+            record["structured"] = _structured_table_from_image(ctx, parsed_root, vlm_client)
+        except Exception as exc:  # noqa: BLE001
+            record["structured_error"] = str(exc)
+
+        if verify_with_latex:
+            if not latex_tables:
+                record["latex_verification"] = {"error": "latex_tables_not_found"}
+            elif "structured" not in record:
+                record["latex_verification"] = {"error": "structured_table_missing"}
+            elif t_idx >= len(latex_tables):
+                record["latex_verification"] = {"error": "latex_table_not_aligned"}
+            else:
+                latex_tbl = latex_tables[t_idx]
+                try:
+                    record["latex_verification"] = _verify_structured_with_latex(
+                        ctx,
+                        parsed_root=parsed_root,
+                        vlm=vlm_client,
+                        structured_json=record["structured"],  # type: ignore[arg-type]
+                        latex_table=latex_tbl,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    record["latex_verification"] = {"error": str(exc)}
+        tables.append(record)
     return {"paper_id": arxiv_id.name, "tables": tables}
 
 
@@ -249,14 +365,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vlm-gpus", type=str, default=None, help="启动 vllm serve 使用的 GPU，逗号分隔，默认前四张 0,1,2,3")
     parser.add_argument("--vlm-port", type=int, default=8000, help="启动 vllm serve 的端口")
     parser.add_argument("--window", type=int, default=10, help="表格前后收集的 text 数量")
-    parser.add_argument("--max-intermediate", type=int, default=DEFAULT_INTERMEDIATE, help="每张表最多抽取的中间 hop 对数")
-    parser.add_argument("--max-final", type=int, default=DEFAULT_FINAL_QA, help="每张表最多生成的最终问答对数")
     parser.add_argument(
-        "--mode",
-        type=str,
-        default="intermediate",
-        choices=MODE_CHOICES,
-        help="生成中间 hop 还是最终 QA（intermediate|final）",
+        "--body-only",
+        action="store_true",
+        default=True,
+        help="仅使用正文表格（遇到 references/appendix/ref_text 即停止），默认开启",
+    )
+    parser.add_argument(
+        "--all-tables",
+        action="store_false",
+        dest="body_only",
+        help="禁用正文截断，使用全部表格（不推荐）",
+    )
+    parser.add_argument(
+        "--verify-with-latex",
+        action="store_true",
+        help="在 structured 模式下，对照 LaTeX 表格让 VLM 进行一致性判定",
+    )
+    parser.add_argument(
+        "--latex-base",
+        type=Path,
+        default=None,
+        help="LaTeX 源码所在根目录（默认尝试 test_database/latex_src/{arxiv_id}）",
     )
     return parser.parse_args()
 
@@ -273,9 +403,9 @@ def main() -> None:
         vlm_gpus=args.vlm_gpus,
         vlm_port=args.vlm_port,
         window=args.window,
-        max_intermediate=args.max_intermediate,
-        max_final=args.max_final,
-        mode=args.mode,
+        body_only=args.body_only,
+        verify_with_latex=args.verify_with_latex,
+        latex_base=args.latex_base,
     )
     print(json.dumps(hops, ensure_ascii=False, indent=2))
 
