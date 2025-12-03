@@ -23,11 +23,11 @@ Output: JSON with one entry per table containing:
 - Body-only is on by default; use `--all-tables` to include appendix/reference tables.
 
 ## VLM connection
-- `--vlm-model`, `--vlm-base-url`, `--vlm-api-key`
-- `--vlm-launch-server` with `--vlm-model-path`, `--vlm-gpus`, `--vlm-port`
+- Extract VLM: `--extract-vlm-model`, `--extract-vlm-base-url`, `--extract-vlm-api-key`, `--extract-vlm-launch-server`, `--extract-vlm-model-path`, `--extract-vlm-gpus`, `--extract-vlm-port`
+- Verification VLM (optional, defaults to extract VLM): `--verify-vlm-model`, `--verify-vlm-base-url`, `--verify-vlm-api-key`, `--verify-vlm-launch-server`, `--verify-vlm-model-path`, `--verify-vlm-gpus`, `--verify-vlm-port`
 
 ## Workflow summary
 1) Load MinerU `content_list` and keep正文 tables (unless `--all-tables`).  
 2) For each table image, call VLM with the hierarchical-column prompt to get structured JSON.  
 3) (Optional) Load the aligned LaTeX table and ask VLM to judge table identity + content match, recording issues.  
-4) Emit a JSON object: `{"paper_id": "...", "tables": [...]}`.***
+4) Emit a JSON object: `{"paper_id": "...", "tables": [...]}`.

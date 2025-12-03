@@ -283,15 +283,44 @@ def _load_latex_tables(arxiv_id: Path, base_dir: Path) -> List[Dict]:
         return []
 
 
+def _make_vlm_client(
+    model: str,
+    base_url: str | None,
+    api_key: str | None,
+    launch_server: bool,
+    model_path: str | None,
+    gpus: Optional[List[int]],
+    port: int,
+) -> VLMClient:
+    return VLMClient(
+        config=VLMConfig(
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            launch_server=launch_server,
+            model_path=model_path,
+            gpus=gpus or [0, 1, 2, 3],
+            port=port,
+        )
+    )
+
+
 def build_paper_hops(
     paper_dir: Path,
-    vlm_model: str = "gpt-4o-mini",
-    vlm_base_url: str | None = None,
-    vlm_api_key: str | None = None,
-    vlm_launch_server: bool = False,
-    vlm_model_path: str | None = None,
-    vlm_gpus: str | None = None,  # 逗号分隔，如 "0,1,2,3"
-    vlm_port: int = 8000,
+    extract_vlm_model: str = "gpt-4o-mini",
+    extract_vlm_base_url: str | None = None,
+    extract_vlm_api_key: str | None = None,
+    extract_vlm_launch_server: bool = False,
+    extract_vlm_model_path: str | None = None,
+    extract_vlm_gpus: str | None = None,  # 逗号分隔，如 "0,1,2,3"
+    extract_vlm_port: int = 8000,
+    verify_vlm_model: str | None = None,
+    verify_vlm_base_url: str | None = None,
+    verify_vlm_api_key: str | None = None,
+    verify_vlm_launch_server: bool | None = None,
+    verify_vlm_model_path: str | None = None,
+    verify_vlm_gpus: str | None = None,
+    verify_vlm_port: int | None = None,
     window: int = 10,
     body_only: bool = True,
     verify_with_latex: bool = False,
@@ -322,27 +351,40 @@ def build_paper_hops(
     if verify_with_latex:
         latex_tables = _load_latex_tables(arxiv_id, latex_base or PACKAGE_ROOT)
 
-    gpu_ids = None
-    if vlm_gpus:
-        gpu_ids = [int(x) for x in vlm_gpus.split(",") if x.strip().isdigit()]
-    vlm_client = VLMClient(
-        config=VLMConfig(
-            model=vlm_model,
-            base_url=vlm_base_url,
-            api_key=vlm_api_key,
-            launch_server=vlm_launch_server,
-            model_path=vlm_model_path,
-            gpus=gpu_ids or [0, 1, 2, 3],
-            port=vlm_port,
-        )
+    extract_gpu_ids = [int(x) for x in extract_vlm_gpus.split(",") if x.strip().isdigit()] if extract_vlm_gpus else None
+    vlm_client = _make_vlm_client(
+        model=extract_vlm_model,
+        base_url=extract_vlm_base_url,
+        api_key=extract_vlm_api_key,
+        launch_server=extract_vlm_launch_server,
+        model_path=extract_vlm_model_path,
+        gpus=extract_gpu_ids,
+        port=extract_vlm_port,
     )
 
+<<<<<<< HEAD
     # --- 自定义保存目录设置 ---
     BASE_SAVE_DIR = Path("/inspire/hdd/project/embodied-multimodality/lujiahao-253108120106/workspace/ReadingBench/QA/multihop_qa/Table_Json")
     # 为当前论文创建一个专属子文件夹: Table_Json/{arxiv_id}/
     PAPER_SAVE_DIR = BASE_SAVE_DIR / arxiv_id.name
     PAPER_SAVE_DIR.mkdir(parents=True, exist_ok=True)
     # -----------------------
+=======
+    verify_gpu_ids = extract_gpu_ids
+    if verify_vlm_gpus:
+        verify_gpu_ids = [int(x) for x in verify_vlm_gpus.split(",") if x.strip().isdigit()]
+    verify_client = vlm_client
+    if verify_with_latex:
+        verify_client = _make_vlm_client(
+            model=verify_vlm_model or extract_vlm_model,
+            base_url=verify_vlm_base_url if verify_vlm_base_url is not None else extract_vlm_base_url,
+            api_key=verify_vlm_api_key if verify_vlm_api_key is not None else extract_vlm_api_key,
+            launch_server=verify_vlm_launch_server if verify_vlm_launch_server is not None else extract_vlm_launch_server,
+            model_path=verify_vlm_model_path if verify_vlm_model_path is not None else extract_vlm_model_path,
+            gpus=verify_gpu_ids,
+            port=verify_vlm_port if verify_vlm_port is not None else extract_vlm_port,
+        )
+>>>>>>> 10aea7b409fe5fe050c42c32910a0e168ed65145
 
     tables = []
     for t_idx, ctx in enumerate(contexts):
@@ -373,7 +415,7 @@ def build_paper_hops(
                     record["latex_verification"] = _verify_structured_with_latex(
                         ctx,
                         parsed_root=parsed_root,
-                        vlm=vlm_client,
+                        vlm=verify_client,
                         structured_json=record["structured"],  # type: ignore[arg-type]
                         latex_table=latex_tbl,
                     )
@@ -398,14 +440,23 @@ def build_paper_hops(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="为单篇论文构建基于表格的多跳 hop 结构（依赖 VLM）")
     parser.add_argument("--paper", type=Path, required=True, help="mineru 处理后的论文目录（arxiv_id 或其下的 vlm）")
-    parser.add_argument("--vlm-model", type=str, default="gpt-4o-mini", help="VLM 模型名（serve 接口使用）")
-    parser.add_argument("--vlm-base-url", type=str, default="http://localhost:8000/v1", help="已有 vLLM serve 的 base_url（如 http://localhost:8000/v1）")
-    parser.add_argument("--vlm-api-key", type=str, default=None, help="serve 的 api_key")
-    parser.add_argument("--vlm-launch-server", action="store_true", help="是否在本进程内启动 vllm serve")
-    parser.add_argument("--vlm-model-path", type=str, default=None, help="启动 vllm serve 时的模型路径")
-    parser.add_argument("--vlm-gpus", type=str, default=None, help="启动 vllm serve 使用的 GPU，逗号分隔，默认前四张 0,1,2,3")
-    parser.add_argument("--vlm-port", type=int, default=8000, help="启动 vllm serve 的端口")
+    # Extract VLM
+    parser.add_argument("--extract-vlm-model", type=str, default="gpt-4o-mini", help="表格抽取阶段的 VLM 模型名")
+    parser.add_argument("--extract-vlm-base-url", type=str, default="http://localhost:8000/v1", help="表格抽取 VLM 的 base_url（如 http://localhost:8000/v1）")
+    parser.add_argument("--extract-vlm-api-key", type=str, default=None, help="表格抽取 VLM 的 api_key")
+    parser.add_argument("--extract-vlm-launch-server", action="store_true", help="是否在本进程内启动表格抽取 VLM（vllm serve）")
+    parser.add_argument("--extract-vlm-model-path", type=str, default=None, help="抽取 VLM 启动时的模型路径")
+    parser.add_argument("--extract-vlm-gpus", type=str, default=None, help="抽取 VLM 使用的 GPU，逗号分隔，默认前四张 0,1,2,3")
+    parser.add_argument("--extract-vlm-port", type=int, default=8000, help="抽取 VLM 的服务端口")
     parser.add_argument("--window", type=int, default=10, help="表格前后收集的 text 数量")
+    # Verification VLM overrides
+    parser.add_argument("--verify-vlm-model", type=str, default=None, help="验证阶段使用的 VLM 模型名（默认与抽取一致）")
+    parser.add_argument("--verify-vlm-base-url", type=str, default=None, help="验证阶段 VLM base_url（默认与抽取一致）")
+    parser.add_argument("--verify-vlm-api-key", type=str, default=None, help="验证阶段 VLM api_key（默认与抽取一致）")
+    parser.add_argument("--verify-vlm-launch-server", action="store_true", help="验证阶段是否在本进程内启动 vllm serve")
+    parser.add_argument("--verify-vlm-model-path", type=str, default=None, help="验证阶段启动 vllm serve 时的模型路径")
+    parser.add_argument("--verify-vlm-gpus", type=str, default=None, help="验证阶段使用的 GPU，逗号分隔")
+    parser.add_argument("--verify-vlm-port", type=int, default=None, help="验证阶段启动 vllm serve 的端口")
     parser.add_argument(
         "--body-only",
         action="store_true",
@@ -436,13 +487,20 @@ def main() -> None:
     args = parse_args()
     hops = build_paper_hops(
         paper_dir=args.paper,
-        vlm_model=args.vlm_model,
-        vlm_base_url=args.vlm_base_url,
-        vlm_api_key=args.vlm_api_key,
-        vlm_launch_server=args.vlm_launch_server,
-        vlm_model_path=args.vlm_model_path,
-        vlm_gpus=args.vlm_gpus,
-        vlm_port=args.vlm_port,
+        extract_vlm_model=args.extract_vlm_model,
+        extract_vlm_base_url=args.extract_vlm_base_url,
+        extract_vlm_api_key=args.extract_vlm_api_key,
+        extract_vlm_launch_server=args.extract_vlm_launch_server,
+        extract_vlm_model_path=args.extract_vlm_model_path,
+        extract_vlm_gpus=args.extract_vlm_gpus,
+        extract_vlm_port=args.extract_vlm_port,
+        verify_vlm_model=args.verify_vlm_model,
+        verify_vlm_base_url=args.verify_vlm_base_url,
+        verify_vlm_api_key=args.verify_vlm_api_key,
+        verify_vlm_launch_server=args.verify_vlm_launch_server if args.verify_vlm_launch_server else None,
+        verify_vlm_model_path=args.verify_vlm_model_path,
+        verify_vlm_gpus=args.verify_vlm_gpus,
+        verify_vlm_port=args.verify_vlm_port,
         window=args.window,
         body_only=args.body_only,
         verify_with_latex=args.verify_with_latex,
