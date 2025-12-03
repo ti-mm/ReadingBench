@@ -24,6 +24,7 @@ from multihop_qa.vlm_client import VLMClient, VLMConfig
 
 STRUCTURED_TABLE_MAX_TOKENS = 1600
 VERIFY_MAX_TOKENS = 600
+STRUCTURED_RETRY = 3
 
 
 def _trim_text(text: str, limit: int = 3200) -> str:
@@ -224,7 +225,13 @@ def _structured_table_prompt(caption: List[str]) -> str:
 
 def _structured_table_from_image(ctx: TableContext, parsed_root: Path, vlm: VLMClient) -> Dict:
     prompt = _structured_table_prompt(ctx.table_caption)
-    return vlm.ask_json(ctx.image_full_path(parsed_root), prompt, max_tokens=STRUCTURED_TABLE_MAX_TOKENS)
+    last_exc: Exception | None = None
+    for _ in range(STRUCTURED_RETRY):
+        try:
+            return vlm.ask_json(ctx.image_full_path(parsed_root), prompt, max_tokens=STRUCTURED_TABLE_MAX_TOKENS)
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+    raise RuntimeError(f"structured table parse failed after {STRUCTURED_RETRY} retries: {last_exc}")
 
 
 def _verify_prompt(structured_json: Dict, latex_table: Dict) -> str:
