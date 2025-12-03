@@ -19,7 +19,7 @@ if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
 from multihop_qa.models import TableContext
-from multihop_qa.mapping_llm import extract_tables_from_package
+from multihop_qa.latex_tables_pylatexenc import extract_tables_from_package
 from multihop_qa.vlm_client import VLMClient, VLMConfig
 
 STRUCTURED_TABLE_MAX_TOKENS = 1600
@@ -245,14 +245,15 @@ def _verify_prompt(structured_json: Dict, latex_table: Dict) -> str:
         "你会看到表格图片（已附在消息中）、该表格的 LaTeX 片段，以及从图片抽取的 JSON。"
         "任务：\n"
         "1) 判断 JSON 是否对应这段 LaTeX 的同一张表（same_table）。\n"
-        "2) 若对应，检查列/分组/数据是否一致，指出缺失或错误。\n"
+        "2) 若对应，主要检查数值是否一致；列名/分组名只要基本匹配即可（轻微差异可接受），无需关心 caption。\n"
+        "3) 发现数值不一致或缺失时写入 problems。\n"
         "请严格遵守以下 JSON 格式返回：\n"
         '{"same_table": true/false, "content_match": true/false, "problems": ["..."], "summary": "..."}\n\n'
         "重要格式警告：\n"
         "- 必须直接返回纯 JSON 字符串。\n"
         "- 绝对不要使用 Markdown 代码块（不要用 ```json ... ```）。\n"
         "- 不要包含任何其他前缀或后缀文字。\n"
-        f"\n\nLaTeX 表格片段：\n{latex_text}\n\n图片抽取 JSON：\n{structured_text}"
+        f"\n\nLaTeX 表格片段（忽略 caption）：\n{latex_text}\n\n图片抽取 JSON：\n{structured_text}"
     )
 
 

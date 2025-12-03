@@ -16,13 +16,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from multihop_qa.mapping_llm import extract_tables_from_package
+from multihop_qa.latex_tables_regex import extract_tables_from_package
 
 
 def main() -> None:
     repo_root = REPO_ROOT
     latex_root = repo_root / "test_database" / "latex_src"
-    output_path = Path(__file__).resolve().parent / "latex_tables.jsonl"
+    output_path = Path(__file__).resolve().parent / "latex_tables_regex.jsonl"
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     records = []
