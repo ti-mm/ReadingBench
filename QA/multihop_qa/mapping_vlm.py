@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import sys
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
@@ -25,6 +26,7 @@ from multihop_qa.vlm_client import VLMClient, VLMConfig
 STRUCTURED_TABLE_MAX_TOKENS = 1600
 VERIFY_MAX_TOKENS = 600
 STRUCTURED_RETRY = 3
+NUMBER_PATTERN = re.compile(r"-?\d[\d,]*(?:\.\d+)?%?")
 
 
 def _trim_text(text: str, limit: int = 3200) -> str:
@@ -264,6 +266,68 @@ def _verify_structured_with_latex(
     return vlm.ask_json(ctx.image_full_path(parsed_root), prompt, max_tokens=VERIFY_MAX_TOKENS)
 
 
+def _extract_numbers_from_obj(obj: object) -> Set[str]:
+    """
+    递归抽取对象中出现的数字字符串，返回去重后的集合。
+    """
+    nums: Set[str] = set()
+    if isinstance(obj, dict):
+        for v in obj.values():
+            nums |= _extract_numbers_from_obj(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            nums |= _extract_numbers_from_obj(v)
+    elif isinstance(obj, (int, float)):
+        nums.add(str(obj))
+    elif isinstance(obj, str):
+        for match in NUMBER_PATTERN.findall(obj):
+            cleaned = match.replace(",", "")
+            if cleaned:
+                nums.add(cleaned)
+    return nums
+
+
+def _numbers_from_structured_table(structured_json: Dict) -> Set[str]:
+    return _extract_numbers_from_obj(structured_json)
+
+
+def _numbers_from_latex_table(latex_table: Dict) -> Set[str]:
+    return _extract_numbers_from_obj(latex_table.get("content", ""))
+
+
+def _numeric_similarity(a: Set[str], b: Set[str]) -> float:
+    if not a and not b:
+        return 0.0
+    intersection = len(a & b)
+    union = len(a | b)
+    return intersection / union if union else 0.0
+
+
+def _best_latex_match(
+    structured_json: Dict,
+    latex_tables: List[Dict],
+    latex_numbers_cache: Optional[List[Set[str]]] = None,
+) -> Tuple[Optional[int], float]:
+    """
+    基于数字的 Jaccard 相似度，从 latex_tables 中挑选与 structured_json 最相似的表格。
+    返回 (best_index, similarity_score)，若 latex_tables 为空则返回 (None, 0.0)。
+    """
+    if not latex_tables:
+        return None, 0.0
+    structured_nums = _numbers_from_structured_table(structured_json)
+    best_idx: Optional[int] = None
+    best_score = -1.0
+    for idx, latex_tbl in enumerate(latex_tables):
+        latex_nums = latex_numbers_cache[idx] if latex_numbers_cache and idx < len(latex_numbers_cache) else _numbers_from_latex_table(latex_tbl)
+        score = _numeric_similarity(structured_nums, latex_nums)
+        if score > best_score:
+            best_idx = idx
+            best_score = score
+    if best_idx is None:
+        return None, 0.0
+    return best_idx, best_score
+
+
 def _load_latex_tables(arxiv_id: Path, base_dir: Path) -> List[Dict]:
     candidates = [
         base_dir / "test_database" / "latex_src" / arxiv_id.name,
@@ -349,8 +413,10 @@ def build_paper_hops(
     contexts = _contexts_from_items(items, arxiv_id.name, vlm_dir, parsed_root, window=window)
 
     latex_tables: List[Dict] = []
+    latex_numbers: List[Set[str]] = []
     if verify_with_latex:
         latex_tables = _load_latex_tables(arxiv_id, latex_base or PACKAGE_ROOT)
+        latex_numbers = [_numbers_from_latex_table(tbl) for tbl in latex_tables]
 
     extract_gpu_ids = [int(x) for x in extract_vlm_gpus.split(",") if x.strip().isdigit()] if extract_vlm_gpus else None
     vlm_client = _make_vlm_client(
@@ -405,20 +471,24 @@ def build_paper_hops(
                 record["latex_verification"] = {"error": "latex_tables_not_found"}
             elif "structured" not in record:
                 record["latex_verification"] = {"error": "structured_table_missing"}
-            elif t_idx >= len(latex_tables):
-                record["latex_verification"] = {"error": "latex_table_not_aligned"}
             else:
-                latex_tbl = latex_tables[t_idx]
-                try:
-                    record["latex_verification"] = _verify_structured_with_latex(
-                        ctx,
-                        parsed_root=parsed_root,
-                        vlm=verify_client,
-                        structured_json=record["structured"],  # type: ignore[arg-type]
-                        latex_table=latex_tbl,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    record["latex_verification"] = {"error": str(exc)}
+                best_idx, best_score = _best_latex_match(record["structured"], latex_tables, latex_numbers)  # type: ignore[arg-type]
+                record["latex_match_index"] = best_idx
+                record["latex_match_score"] = best_score
+                if best_idx is None:
+                    record["latex_verification"] = {"error": "latex_table_not_aligned"}
+                else:
+                    latex_tbl = latex_tables[best_idx]
+                    try:
+                        record["latex_verification"] = _verify_structured_with_latex(
+                            ctx,
+                            parsed_root=parsed_root,
+                            vlm=verify_client,
+                            structured_json=record["structured"],  # type: ignore[arg-type]
+                            latex_table=latex_tbl,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        record["latex_verification"] = {"error": str(exc)}
 
         # 3. 将包含验证信息的完整 record 写入文件
         try:
