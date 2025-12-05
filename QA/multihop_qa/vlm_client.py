@@ -72,6 +72,27 @@ class VLMClient:
 
         self._client = OpenAI(api_key=api_key, base_url=base_url)
 
+    def _clean_markdown_json(self, content: str) -> str:
+        """
+        清洗 VLM 输出中可能包含的 Markdown 代码块标记
+        """
+        content = content.strip()
+        # 去掉开头的 ```json 或 ```
+        if content.startswith("```"):
+            # 找到第一个换行符
+            newline_idx = content.find("\n")
+            if newline_idx != -1:
+                content = content[newline_idx+1:]
+            else:
+                # 极端情况：只有一行，直接暴力去掉前缀
+                content = content.replace("```json", "").replace("```", "")
+        
+        # 去掉结尾的 ```
+        if content.endswith("```"):
+            content = content[:-3]
+        
+        return content.strip()
+
     def ask_json(self, image_path: Path, prompt: str, max_tokens: int = 800) -> Dict:
         self._ensure_client()
         assert self._client is not None
@@ -91,9 +112,15 @@ class VLMClient:
         content = resp.choices[0].message.content if resp and resp.choices else ""
         if not content:
             raise RuntimeError("VLM 返回为空")
+        
+        # === 新增：清洗 Markdown 标记 ===
+        cleaned_content = self._clean_markdown_json(content)
+        # ==============================
+
         try:
-            return json.loads(content)
+            return json.loads(cleaned_content)
         except json.JSONDecodeError as exc:
+            # 记录原始返回内容以便调试
             raise RuntimeError(f"VLM JSON 解析失败: {content}") from exc
 
     def read_table(self, image_path: Path) -> Dict:

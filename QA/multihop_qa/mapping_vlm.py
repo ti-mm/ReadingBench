@@ -3,7 +3,7 @@
 从 MinerU 解析结果中取正文表格，调用 VLM 将表格图片转为结构化 JSON，可选再对照 LaTeX 表格做一致性判定。
 
 示例：
-    python QA/multihop_qa/mapping_vlm.py --paper QA/test_database/parsed_pdfs/1610.02136 --verify-with-latex
+    python QA/multihop_qa/mapping_vlm.py --paper QA/test_database/parsed_pdfs/1610.02136 --verify-with-latex --save-dir /path/to/save
 """
 
 from __future__ import annotations
@@ -20,11 +20,11 @@ if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
 from multihop_qa.models import TableContext
-from multihop_qa.latex_tables_pylatexenc import extract_tables_from_package
+from multihop_qa.latex_tables_regex import extract_tables_from_package
 from multihop_qa.vlm_client import VLMClient, VLMConfig
 
 STRUCTURED_TABLE_MAX_TOKENS = 1600
-VERIFY_MAX_TOKENS = 600
+VERIFY_MAX_TOKENS = 1000
 STRUCTURED_RETRY = 3
 NUMBER_PATTERN = re.compile(r"-?\d[\d,]*(?:\.\d+)?%?")
 
@@ -243,15 +243,22 @@ def _verify_prompt(structured_json: Dict, latex_table: Dict) -> str:
     latex_body = latex_table.get("content") or ""
     latex_text = _trim_text(latex_body, limit=3000)
     structured_text = json.dumps(structured_json, ensure_ascii=False)
+    # 调整 JSON 输出顺序：先 analysis (Reasoning)，后 conclusions (Tag)
     return (
         "你会看到表格图片（已附在消息中）、该表格的 LaTeX 片段，以及从图片抽取的 JSON。"
         "任务：\n"
-        "1) 判断 JSON 是否对应这段 LaTeX 的同一张表（same_table）。\n"
-        "2) 若对应，主要检查数值是否一致；列名/分组名只要基本匹配即可（轻微差异可接受），无需关心 caption。\n"
-        "3) 发现数值不一致或缺失时写入 problems。\n"
-        "请严格遵守以下 JSON 格式返回：\n"
-        '{"same_table": true/false, "content_match": true/false, "problems": ["..."], "summary": "..."}\n\n'
+        "1) 仔细逐项对比数值和结构，判断 JSON 是否对应这段 LaTeX 的同一张表。\n"
+        "2) 先进行详细的思维链分析（analysis），指出匹配点或差异点。\n"
+        "3) 最后给出判断结论（same_table, content_match）。\n\n"
+        "请严格遵守以下 JSON 格式顺序返回（**先分析，后结论**）：\n"
+        "{\n"
+        '  "analysis": "在此处进行详细的对比分析，检查行、列、数值是否一致...",\n'
+        '  "problems": ["如果不一致，列出具体差异...", "如果一致，请留空"],\n'
+        '  "same_table": true/false,\n'
+        '  "content_match": true/false\n'
+        "}\n\n"
         "重要格式警告：\n"
+        "- 必须先输出 analysis 字段，再输出结论。\n"
         "- 必须直接返回纯 JSON 字符串。\n"
         "- 绝对不要使用 Markdown 代码块（不要用 ```json ... ```）。\n"
         "- 不要包含任何其他前缀或后缀文字。\n"
@@ -390,6 +397,7 @@ def build_paper_hops(
     body_only: bool = True,
     verify_with_latex: bool = False,
     latex_base: Path | None = None,
+    save_dir: Path | None = None,
 ) -> Dict:
     """
     返回结构:
@@ -401,7 +409,8 @@ def build_paper_hops(
            "table_entry_index": ...,
            "image_path": "...",
            "structured": {...},
-           "latex_verification": {...}  # 可选
+           "latex_verification": {...},  # 可选
+           "matched_latex_content": "..." # 可选，调试用
          }, ...
       ]
     }
@@ -430,11 +439,17 @@ def build_paper_hops(
     )
 
     # --- 自定义保存目录设置 ---
-    BASE_SAVE_DIR = Path("/inspire/hdd/project/embodied-multimodality/lujiahao-253108120106/workspace/ReadingBench/QA/multihop_qa/Table_Json")
-    # 为当前论文创建一个专属子文件夹: Table_Json/{arxiv_id}/
+    if save_dir:
+        BASE_SAVE_DIR = save_dir
+    else:
+        # 默认回退路径
+        BASE_SAVE_DIR = Path("/inspire/hdd/project/embodied-multimodality/lujiahao-253108120106/workspace/ReadingBench/QA/multihop_qa/Table_Json")
+    
+    # 为当前论文创建一个专属子文件夹: {BASE_SAVE_DIR}/{arxiv_id}/
     PAPER_SAVE_DIR = BASE_SAVE_DIR / arxiv_id.name
     PAPER_SAVE_DIR.mkdir(parents=True, exist_ok=True)
     # -----------------------
+
     verify_gpu_ids = extract_gpu_ids
     if verify_vlm_gpus:
         verify_gpu_ids = [int(x) for x in verify_vlm_gpus.split(",") if x.strip().isdigit()]
@@ -475,6 +490,13 @@ def build_paper_hops(
                 best_idx, best_score = _best_latex_match(record["structured"], latex_tables, latex_numbers)  # type: ignore[arg-type]
                 record["latex_match_index"] = best_idx
                 record["latex_match_score"] = best_score
+                
+                # 将匹配到的 Latex 源码存入 JSON
+                if best_idx is not None:
+                    record["matched_latex_content"] = latex_tables[best_idx].get("content", "")
+                else:
+                    record["matched_latex_content"] = None
+                
                 if best_idx is None:
                     record["latex_verification"] = {"error": "latex_table_not_aligned"}
                 else:
@@ -548,6 +570,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="LaTeX 源码所在根目录（默认尝试 test_database/latex_src/{arxiv_id}）",
     )
+    # 新增参数
+    parser.add_argument(
+        "--save-dir",
+        type=Path,
+        default=None,
+        help="结果保存的根目录，脚本会自动在其中创建 {arxiv_id} 子目录。如果不传，则使用代码内置的默认路径。",
+    )
     return parser.parse_args()
 
 
@@ -573,6 +602,7 @@ def main() -> None:
         body_only=args.body_only,
         verify_with_latex=args.verify_with_latex,
         latex_base=args.latex_base,
+        save_dir=args.save_dir,
     )
     print(json.dumps(hops, ensure_ascii=False, indent=2))
 
