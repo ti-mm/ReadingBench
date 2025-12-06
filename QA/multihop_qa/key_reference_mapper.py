@@ -15,6 +15,9 @@
      ...
    }
 
+额外：会对 mapping_vlm 中 latex_verification.same_table 与 content_match 均为 true 的表格，
+调用 LLM 从结构化表格 JSON 中提取可能的“方法/数据集”名称，输出 verified_table_candidates。
+
 注意：仅支持 OpenAI 兼容服务（如 vLLM serve），通过 llm_client.ServeLLMClient 调用。
 """
 
@@ -22,7 +25,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence
 
 from multihop_qa.llm_client import BaseLLMClient, ServeLLMClient, ServeLLMConfig
 
@@ -39,10 +42,41 @@ def extract_ref_texts(arxiv_id: str, base_dir: Path) -> List[str]:
         items = json.loads(content_path.read_text(encoding="utf-8"))
     except Exception:
         return []
+
+    def _is_ref_text(entry: Dict) -> bool:
+        return entry.get("type") == "ref_text" or entry.get("sub_type") == "ref_text"
+
+    def _get_text(entry: Dict) -> str:
+        if entry.get("text"):
+            return str(entry.get("text"))
+        if isinstance(entry.get("list_items"), list):
+            return "\n".join(str(x) for x in entry["list_items"])
+        return ""
+
     refs: List[str] = []
+    prev_ref_text: Optional[str] = None
     for item in items:
-        if item.get("type") == "ref_text":
-            refs.append(item.get("text", ""))
+        if not _is_ref_text(item):
+            prev_ref_text = None
+            continue
+
+        curr_text = _get_text(item)
+        if not curr_text:
+            prev_ref_text = None
+            continue
+
+        # 构造上下文增强块：如果前一个也是 ref_text，则拼接其末尾 3 行（或末尾 400 字符）。
+        merged = curr_text
+        if prev_ref_text:
+            lines = prev_ref_text.splitlines()
+            tail_lines = "\n".join(lines[-3:]) if lines else ""
+            tail_chars = prev_ref_text[-400:]
+            tail = tail_lines or tail_chars
+            merged = tail + ("\n" if tail else "") + curr_text
+
+        refs.append(merged)
+        prev_ref_text = curr_text
+
     return refs
 
 
@@ -72,11 +106,94 @@ def _disambiguate(llm: BaseLLMClient, key: str, candidates: List[str]) -> Dict:
     return llm.ask_json(prompt)
 
 
+def _verified_table_prompt(table_idx: int, structured_table: Dict) -> str:
+    table_json = json.dumps(structured_table, ensure_ascii=False)
+    return (
+        "你会看到一张已经通过 LaTeX 校验（same_table=true 且 content_match=true）的表格 JSON。"
+        "请找出其中可能代表“方法/模型/算法名称”或“数据集/任务名称”的词语，过滤掉度量指标/列名（如 Accuracy、F1、Params、Epoch）。"
+        "只返回纯 JSON，不要解释，格式："
+        '{"candidates": [{"name": "...", "type": "method|dataset|other", "reason": "..."}]}。\n\n'
+        f"表格索引: {table_idx}\n表格 JSON:\n{table_json}"
+    )
+
+
+def _extract_candidates_from_verified_tables(
+    mapping_result: Dict, llm_client: BaseLLMClient, max_tokens: int = 800
+) -> Dict[str, Dict]:
+    """
+    针对 mapping_vlm 输出中 latex_verification.same_table/content_match 均为 True 的表格，
+    调用 LLM 识别其中可能的“方法/数据集”名称。
+    返回一个 dict，key 为表格顺序索引（字符串），value 包含候选列表等信息。
+    """
+    table_candidates: Dict[str, Dict] = {}
+    tables = mapping_result.get("tables", [])
+    for idx, table in enumerate(tables):
+        verification: Optional[Dict] = table.get("latex_verification")
+        structured = table.get("structured")
+        if not verification or verification.get("same_table") is not True or verification.get("content_match") is not True:
+            continue
+        if not isinstance(structured, dict):
+            continue
+
+        try:
+            resp = llm_client.ask_json(_verified_table_prompt(idx, structured), max_tokens=max_tokens)
+            raw_candidates = resp.get("candidates", [])
+        except Exception as exc:  # noqa: BLE001
+            table_candidates[str(idx)] = {
+                "table_order_index": table.get("table_order_index", idx),
+                "table_entry_index": table.get("table_entry_index"),
+                "caption": structured.get("caption"),
+                "candidates": [],
+                "error": str(exc),
+            }
+            continue
+
+        parsed: List[Dict[str, str]] = []
+        if isinstance(raw_candidates, list):
+            seen = set()
+            for cand in raw_candidates:
+                if isinstance(cand, dict):
+                    name = str(cand.get("name", "")).strip()
+                    if not name:
+                        continue
+                    norm_name = name.lower()
+                    if norm_name in seen:
+                        continue
+                    seen.add(norm_name)
+                    parsed.append(
+                        {
+                            "name": name,
+                            "type": str(cand.get("type", "unknown")),
+                            "reason": str(cand.get("reason", "")),
+                        }
+                    )
+                elif isinstance(cand, str):
+                    name = cand.strip()
+                    if not name:
+                        continue
+                    norm_name = name.lower()
+                    if norm_name in seen:
+                        continue
+                    seen.add(norm_name)
+                    parsed.append({"name": name, "type": "unknown", "reason": ""})
+
+        table_candidates[str(idx)] = {
+            "table_order_index": table.get("table_order_index", idx),
+            "table_entry_index": table.get("table_entry_index"),
+            "caption": structured.get("caption"),
+            "candidates": parsed,
+        }
+
+    return table_candidates
+
+
 def map_keys_to_references(
     mapping_result: Dict,
     llm_client: BaseLLMClient,
     base_dir: Path,
     chunk_size: int = 5,
+    extract_verified_tables: bool = True,
+    verified_table_max_tokens: int = 800,
 ) -> Dict:
     """
     为 mapping_result 增加 key_reference_map。
@@ -123,4 +240,8 @@ def map_keys_to_references(
 
     enriched = dict(mapping_result)
     enriched["key_reference_map"] = key_reference_map
+    if extract_verified_tables:
+        enriched["verified_table_candidates"] = _extract_candidates_from_verified_tables(
+            mapping_result, llm_client, max_tokens=verified_table_max_tokens
+        )
     return enriched
