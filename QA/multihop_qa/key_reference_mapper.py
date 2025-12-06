@@ -23,11 +23,14 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence
 
 from multihop_qa.llm_client import BaseLLMClient, ServeLLMClient, ServeLLMConfig
+
+PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 
 
 def extract_ref_texts(arxiv_id: str, base_dir: Path) -> List[str]:
@@ -104,6 +107,16 @@ def _disambiguate(llm: BaseLLMClient, key: str, candidates: List[str]) -> Dict:
         f"key: {key}\n候选：\n- " + "\n- ".join(candidates)
     )
     return llm.ask_json(prompt)
+
+
+def _verification_ok(record: Dict) -> bool:
+    """
+    仅依据 latex_verification.same_table 与 content_match 判定是否处理。
+    """
+    if not isinstance(record, dict):
+        return False
+    verify = record.get("latex_verification", {})
+    return bool(verify and verify.get("same_table") is True and verify.get("content_match") is True)
 
 
 def _verified_table_prompt(table_idx: int, structured_table: Dict) -> str:
@@ -245,3 +258,112 @@ def map_keys_to_references(
             mapping_result, llm_client, max_tokens=verified_table_max_tokens
         )
     return enriched
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="遍历子目录 JSON，按 latex_verification 状态过滤并运行 key-reference 映射")
+    parser.add_argument("--input-dir", type=Path, required=True, help="子目录路径，例如 Table_Json/1610.02136")
+    parser.add_argument(
+        "--base-dir",
+        type=Path,
+        default=PACKAGE_ROOT,
+        help="数据根目录，用于查找 test_database/parsed_pdfs，默认 QA 根目录",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="输出目录，默认覆盖写回 input-dir",
+    )
+    parser.add_argument(
+        "--require-match",
+        action="store_true",
+        help="仅处理 latex_verification.same_table/content_match 均为 true 的文件",
+    )
+    parser.add_argument("--chunk-size", type=int, default=5, help="refs 分块大小")
+    parser.add_argument(
+        "--verified-table-max-tokens",
+        type=int,
+        default=800,
+        help="verified_table_candidates 调用的最大 token 数",
+    )
+    parser.add_argument("--llm-model", type=str, default="gpt-4o-mini", help="LLM 模型名（serve 的 served-model-name）")
+    parser.add_argument("--llm-base-url", type=str, default="http://localhost:8000/v1", help="LLM 服务 base_url")
+    parser.add_argument("--llm-api-key", type=str, default=None, help="LLM API key")
+    parser.add_argument("--temperature", type=float, default=0.0, help="LLM 温度")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
+    input_dir = args.input_dir
+    if not input_dir.is_dir():
+        print(f"[Error] input-dir is not a directory: {input_dir}")
+        return
+
+    output_dir = args.output_dir or input_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    llm_client = ServeLLMClient(
+        ServeLLMConfig(
+            model=args.llm_model,
+            base_url=str(args.llm_base_url),
+            api_key=args.llm_api_key,
+            temperature=args.temperature,
+        )
+    )
+
+    total = 0
+    processed = 0
+    skipped_unmatched = 0
+    errors = 0
+
+    for jf in sorted(input_dir.glob("*.json")):
+        total += 1
+        try:
+            data = json.loads(jf.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            errors += 1
+            print(f"[Skip] {jf.name}: read error {exc}")
+            continue
+
+        if args.require_match and not _verification_ok(data):
+            skipped_unmatched += 1
+            print(f"[Skip] {jf.name}: latex_verification not matched (same_table/content_match not both true)")
+            continue
+
+        paper_id = data.get("paper_id") or input_dir.name
+        mapping_result: Dict[str, object] = {"paper_id": paper_id, "tables": [data]}
+        try:
+            enriched = map_keys_to_references(
+                mapping_result,
+                llm_client=llm_client,
+                base_dir=args.base_dir,
+                chunk_size=args.chunk_size,
+                extract_verified_tables=True,
+                verified_table_max_tokens=args.verified_table_max_tokens,
+            )
+        except Exception as exc:  # noqa: BLE001
+            errors += 1
+            print(f"[Error] {jf.name}: mapping failed {exc}")
+            continue
+
+        out_record = dict(data)
+        out_record["paper_id"] = enriched.get("paper_id", paper_id)
+        if "key_reference_map" in enriched:
+            out_record["key_reference_map"] = enriched.get("key_reference_map")
+        if "verified_table_candidates" in enriched:
+            out_record["verified_table_candidates"] = enriched.get("verified_table_candidates")
+
+        out_path = output_dir / jf.name
+        out_path.write_text(json.dumps(out_record, ensure_ascii=False, indent=2), encoding="utf-8")
+        processed += 1
+        print(f"[Processed] {jf.name} -> {out_path}")
+
+    print(
+        f"Done. scanned={total}, processed={processed}, skipped_unmatched={skipped_unmatched}, errors={errors}, output_dir={output_dir}"
+    )
+
+
+if __name__ == "__main__":
+    main()
