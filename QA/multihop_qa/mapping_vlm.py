@@ -23,7 +23,7 @@ from multihop_qa.models import TableContext
 from multihop_qa.latex_tables_regex import extract_tables_from_package
 from multihop_qa.vlm_client import VLMClient, VLMConfig
 
-STRUCTURED_TABLE_MAX_TOKENS = 1600
+STRUCTURED_TABLE_MAX_TOKENS = 4096
 VERIFY_MAX_TOKENS = 1000
 STRUCTURED_RETRY = 3
 NUMBER_PATTERN = re.compile(r"-?\d[\d,]*(?:\.\d+)?%?")

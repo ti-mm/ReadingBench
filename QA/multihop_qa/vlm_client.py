@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import json_repair
 import os
 import subprocess
 import time
@@ -63,6 +64,9 @@ class VLMClient:
                 str(self.config.port),
                 "--tensor-parallel-size",
                 str(len(gpus)),
+                "--trust-remote-code",      # 允许运行模型自定义代码
+                "--gpu-memory-utilization", "0.95", # 235B 模型很大，最大化显存利用
+                "--max-model-len", "8192"   # 防止显存溢出，根据显存大小适当调整
             ]
             self._server_proc = subprocess.Popen(cmd, env=env)
             time.sleep(2)  # 简单等待服务启动
@@ -118,7 +122,7 @@ class VLMClient:
         # ==============================
 
         try:
-            return json.loads(cleaned_content)
+            return json_repair.loads(cleaned_content)
         except json.JSONDecodeError as exc:
             # 记录原始返回内容以便调试
             raise RuntimeError(f"VLM JSON 解析失败: {content}") from exc
