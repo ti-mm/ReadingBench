@@ -25,12 +25,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence
-
-from multihop_qa.llm_client import BaseLLMClient, ServeLLMClient, ServeLLMConfig
+from typing import Dict, Iterable, List, Optional, Sequence, Set
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
+if str(PACKAGE_ROOT) not in sys.path:
+    sys.path.insert(0, str(PACKAGE_ROOT))
+
+from multihop_qa.llm_client import BaseLLMClient, ServeLLMClient, ServeLLMConfig
 
 
 def extract_ref_texts(arxiv_id: str, base_dir: Path) -> List[str]:
@@ -134,8 +137,7 @@ def _extract_candidates_from_verified_tables(
     mapping_result: Dict, llm_client: BaseLLMClient, max_tokens: int = 800
 ) -> Dict[str, Dict]:
     """
-    针对 mapping_vlm 输出中 latex_verification.same_table/content_match 均为 True 的表格，
-    调用 LLM 识别其中可能的“方法/数据集”名称。
+    针对 mapping_vlm 输出中 latex_verification.same_table/content_match 均为 True 的表格，调用 LLM 识别其中可能的“方法/数据集”名称。
     返回一个 dict，key 为表格顺序索引（字符串），value 包含候选列表等信息。
     """
     table_candidates: Dict[str, Dict] = {}
@@ -200,11 +202,59 @@ def _extract_candidates_from_verified_tables(
     return table_candidates
 
 
+def _key_extraction_prompt(table_idx: int, structured: Dict) -> str:
+    table_json = json.dumps(structured, ensure_ascii=False)
+    return (
+        "你将看到一张表格的结构化 JSON（caption/columns/rows）。请直接从单元格中抽取可能会在参考文献里被提到的名称，"
+        "例如方法/模型/算法名称或具体数据集名称；不要返回任务名称、指标名称、列名、纯数字、单位或空值。"
+        "保持表格原文（大小写、符号、缩写不改写）。\n"
+        '只返回纯 JSON，格式严格为 {"keys": ["原文1", "原文2"]}，不要带解释、前后缀或其他字段。\n\n'
+        f"表格索引: {table_idx}\n表格 JSON:\n{table_json}"
+    )
+
+
+def _extract_keys_from_table(table_idx: int, table: Dict, llm_client: BaseLLMClient, max_tokens: int = 600) -> Set[str]:
+    keys: Set[str] = set()
+    structured = table.get("structured")
+    if not isinstance(structured, dict):
+        return keys
+
+    prompt = _key_extraction_prompt(table_idx, structured)
+    try:
+        resp = llm_client.ask_json(prompt, max_tokens=max_tokens)
+    except Exception:
+        return keys
+
+    raw_keys = resp.get("keys", [])
+    if isinstance(raw_keys, list):
+        for k in raw_keys:
+            if not isinstance(k, str):
+                continue
+            v = k.strip()
+            if not v:
+                continue
+            keys.add(v)
+    return keys
+
+
+def _collect_keys(
+    mapping_result: Dict, llm_client: BaseLLMClient, table_key_max_tokens: int = 600
+) -> Set[str]:
+    """
+    汇总所有表格的 key 候选：直接把 structured JSON 交给 LLM 识别方法/数据集列并抽取值。
+    """
+    keys: Set[str] = set()
+    for idx, table in enumerate(mapping_result.get("tables", [])):
+        keys.update(_extract_keys_from_table(idx, table, llm_client, max_tokens=table_key_max_tokens))
+    return keys
+
+
 def map_keys_to_references(
     mapping_result: Dict,
     llm_client: BaseLLMClient,
     base_dir: Path,
     chunk_size: int = 5,
+    table_key_max_tokens: int = 600,
     extract_verified_tables: bool = True,
     verified_table_max_tokens: int = 800,
 ) -> Dict:
@@ -213,9 +263,7 @@ def map_keys_to_references(
     """
     arxiv_id = mapping_result.get("paper_id", "")
     refs = extract_ref_texts(arxiv_id, base_dir)
-    keys = set()
-    for table in mapping_result.get("tables", []):
-        keys.update(table.get("intermediate_hops", {}).keys())
+    keys = _collect_keys(mapping_result, llm_client, table_key_max_tokens=table_key_max_tokens)
 
     key_reference_map: Dict[str, Dict] = {}
     for key in keys:
@@ -287,6 +335,12 @@ def _parse_args() -> argparse.Namespace:
         default=800,
         help="verified_table_candidates 调用的最大 token 数",
     )
+    parser.add_argument(
+        "--table-key-max-tokens",
+        type=int,
+        default=600,
+        help="从表格 structured 里抽取 key 的 LLM 调用最大 token 数",
+    )
     parser.add_argument("--llm-model", type=str, default="gpt-4o-mini", help="LLM 模型名（serve 的 served-model-name）")
     parser.add_argument("--llm-base-url", type=str, default="http://localhost:8000/v1", help="LLM 服务 base_url")
     parser.add_argument("--llm-api-key", type=str, default=None, help="LLM API key")
@@ -340,6 +394,7 @@ def main() -> None:
                 llm_client=llm_client,
                 base_dir=args.base_dir,
                 chunk_size=args.chunk_size,
+                table_key_max_tokens=args.table_key_max_tokens,
                 extract_verified_tables=True,
                 verified_table_max_tokens=args.verified_table_max_tokens,
             )
